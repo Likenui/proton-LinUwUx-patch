@@ -31,3 +31,17 @@ jobs:
             dist/linuwux.sh
             dist/SHA256SUMS
           generate_release_notes: true
+          body: |
+            ## Install
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/brcly/proton-LinUwUx-patch/main/install.sh | sh
+            ```
+
+            Downloads `liblinuwux.so` and the `linuwux` wrapper from this release into `~/.local/lib` / `~/.local/bin`, verifies the checksum, done. No `git clone`, no compiler.
+
+            Steam launch option:
+
+            ```
+            ~/.local/bin/linuwux %command%
+            ```

@@ -25,7 +25,7 @@
 
 set -eu
 
-REPO="brcly/proton-LinUwUx-patch"
+REPO="brcly/linuwux-runtime"
 BASE_URL="https://github.com/${REPO}/releases/latest/download"
 LIBDIR="${HOME}/.local/lib"
 BINDIR="${HOME}/.local/bin"

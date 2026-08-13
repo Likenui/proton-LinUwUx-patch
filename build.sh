@@ -30,8 +30,9 @@ set -euo pipefail
 
 # YY.MM.DD; add a .N suffix for same-day hotfixes (26.08.13 -> 26.08.13.1).
 # Baked into the .so as LINUWUX_VERSION -- announced on load and readable
-# via 'linuwux --version'.
-VERSION="26.08.13.1"
+# via 'linuwux --version'. LINUWUX_VERSION_OVERRIDE lets the release
+# workflow stamp the exact tag without editing this file.
+VERSION="${LINUWUX_VERSION_OVERRIDE:-26.08.13.1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SCRIPT_DIR}/src/linuwux.c"

@@ -10,9 +10,28 @@ This project does **not** configure host-side requirements for the bypass (UMIP,
 
 ## Requirements
 
-`git`, `gcc`. That's it.
+- **Prebuilt install:** `curl`, `sha256sum` — present on virtually any Linux install already.
+- **Build from source:** `git`, `gcc`.
 
 ## Quick start
+
+Two ways to get `liblinuwux.so` running — pick whichever you prefer.
+
+### Fastest: prebuilt install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/brcly/proton-LinUwUx-patch/main/install.sh | sh
+```
+
+Downloads the latest [release](https://github.com/brcly/proton-LinUwUx-patch/releases)'s `liblinuwux.so` and the `linuwux` wrapper straight into `~/.local/lib` / `~/.local/bin`, verifies the download against a published checksum, and you're done — no `git clone`, no compiler. Steam launch options:
+
+```
+~/.local/bin/linuwux %command%
+```
+
+Re-running the command later re-installs whatever the newest release is — that's the whole update story.
+
+### Build from source
 
 ```bash
 ./build.sh
@@ -26,13 +45,13 @@ LD_PRELOAD="${LD_PRELOAD}:/path/to/liblinuwux.so" %command%
 
 Steam sets its own `LD_PRELOAD` earlier in the launch chain to inject the Steam Overlay (`GameOverlayRenderer64.so`); a bare `LD_PRELOAD=/path/to/liblinuwux.so %command%` clobbers that outright and silences the overlay.
 
-### Simpler: `--install`
+#### Simpler: `--install`
 
 ```bash
 ./build.sh --install
 ```
 
-Installs the library to `~/.local/lib` and a `linuwux` wrapper to `~/.local/bin`, so the launch option is just:
+Installs the library to `~/.local/lib` and a `linuwux` wrapper to `~/.local/bin` (the same destinations `install.sh` uses, so the two are interchangeable), so the launch option is just:
 
 ```
 ~/.local/bin/linuwux %command%
@@ -46,10 +65,13 @@ Once installed, plain `./build.sh` (no `--install` needed again) keeps the insta
 
 ```
 build.sh                 # self-contained: builds, and optionally installs
+install.sh                # fetches + installs the latest prebuilt release
 src/
   linuwux.c              # LD_PRELOAD library -- all LinUwUx logic lives here
   linuwux.sh            # 'linuwux' wrapper template, installed by --install
 ```
+
+A tagged push (`vYY.MM.DD`) triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds `liblinuwux.so` from that exact commit, stamps it with the tag's version, and publishes it plus `linuwux.sh` and a `SHA256SUMS` file as a GitHub Release — what `install.sh` downloads.
 
 ## How LinUwUx is applied
 

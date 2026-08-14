@@ -37,8 +37,34 @@
 #include "faketime.h"
 #include "registry.h"
 
-/* Set on arm leaf; read from all threads. */
-static _Atomic uint64_t g_target_sys_handler = 0;
+enum linuwux_protocol {
+    LINUWUX_PROTO_NONE = 0,
+    LINUWUX_PROTO_MODERN = 1,
+    LINUWUX_PROTO_LEGACY_SINGLE = 2,
+    LINUWUX_PROTO_LEGACY_DUAL = 3,
+};
+
+/*
+ * Single protocol control block. All CPUID arm/query leaves and SIGSYS
+ * routing read/write here instead of scattered atomics.
+ */
+struct linuwux_protocol_state {
+    _Atomic int protocol;
+    _Atomic int rax_is_resume;      /* 1 modern trampoline; 0 legacy keep RCX */
+    _Atomic uint64_t handler;       /* modern TargetSysHandler or legacy single */
+    _Atomic uint64_t full_handler;  /* legacy dual only */
+    _Atomic uint32_t system_id;     /* legacy dual syscall id -> single handler */
+    _Atomic uint32_t full_id;       /* legacy dual syscall id -> full handler */
+};
+
+static struct linuwux_protocol_state g_proto = {
+    .protocol = LINUWUX_PROTO_NONE,
+    .rax_is_resume = 1,
+    .handler = 0,
+    .full_handler = 0,
+    .system_id = 0xffffffffu,
+    .full_id = 0xffffffffu,
+};
 
 /* Spoofed CPUID identity, filled once in the constructor. */
 struct linuwux_cpuid_regs {
@@ -65,26 +91,75 @@ static struct linuwux_cpuid_regs g_spoof_hypervisor_feat;    /* 0x40000001 featu
 
 uint64_t linuwux_cpuid_target_sys_handler(void)
 {
-    return atomic_load(&g_target_sys_handler);
+    return atomic_load(&g_proto.handler);
+}
+
+static int linuwux_protocol_is_legacy(int protocol)
+{
+    return protocol == LINUWUX_PROTO_LEGACY_SINGLE ||
+           protocol == LINUWUX_PROTO_LEGACY_DUAL;
+}
+
+int linuwux_cpuid_legacy_active(void)
+{
+    return linuwux_protocol_is_legacy(atomic_load(&g_proto.protocol));
+}
+
+/* Pick TargetSys / legacy handler for this SIGSYS; 0 = not ours. */
+static uint64_t linuwux_proto_pick_handler(ucontext_t *ctx)
+{
+    int protocol = atomic_load(&g_proto.protocol);
+    uint64_t handler, full_handler, rax, rcx;
+    uint32_t system_id, full_id;
+
+    if (protocol == LINUWUX_PROTO_MODERN)
+        return atomic_load(&g_proto.handler);
+
+    if (!ctx)
+        return 0;
+
+    handler = atomic_load(&g_proto.handler);
+    rax = (uint64_t)ctx->uc_mcontext.gregs[REG_RAX];
+    rcx = (uint64_t)ctx->uc_mcontext.gregs[REG_RCX];
+
+    if (protocol == LINUWUX_PROTO_LEGACY_SINGLE) {
+        if (!handler || (rax != 0x13371337u && rax != 0x13371338u) ||
+            rcx > 0x7fffffffffffULL)
+            return 0;
+        return handler;
+    }
+
+    if (protocol == LINUWUX_PROTO_LEGACY_DUAL) {
+        system_id = atomic_load(&g_proto.system_id);
+        full_handler = atomic_load(&g_proto.full_handler);
+        full_id = atomic_load(&g_proto.full_id);
+
+        if (handler && system_id != 0xffffffffu &&
+            (uint32_t)rax == system_id && rcx <= 0x7fffffffffffULL &&
+            ctx->uc_mcontext.gregs[REG_R10] == 0)
+            return handler;
+
+        if (full_handler && full_id != 0xffffffffu &&
+            (uint32_t)rax == full_id && rcx <= 0x7fffffffffffULL)
+            return full_handler;
+    }
+
+    return 0;
 }
 
 int linuwux_cpuid_syscall_route(ucontext_t *ctx, struct linuwux_syscall_route *out)
 {
     uint64_t handler;
 
-    (void)ctx; /* reserved for legacy dual-handler selection from regs */
-
     if (!out)
         return 0;
 
-    handler = atomic_load(&g_target_sys_handler);
+    handler = linuwux_proto_pick_handler(ctx);
     if (!handler)
         return 0;
 
     out->handler = handler;
-    out->rax_is_resume = 1; /* modern DenuvOwO trampoline */
-    /* Legacy profiles would set rax_is_resume = 0 (and possibly pick
-     * handler from dual-handler state using ctx). */
+    out->rax_is_resume = atomic_load(&g_proto.rax_is_resume);
     return 1;
 }
 
@@ -145,7 +220,7 @@ void linuwux_detect_cpu_vendor(void)
 /*
  * Table-driven KUSER profiles.
  *
- * Modern and (later) legacy single/dual all share one apply path: mprotect
+ * Modern and legacy single/dual all share one apply path: mprotect
  * once, run ops in order, done. Adding a protocol is a new table + profile
  * pointer, not a second hand-written store list.
  */
@@ -284,17 +359,76 @@ static const struct linuwux_kuser_profile kuser_profile_modern = {
     .clear_avx_unless_proton_avx = 1,
 };
 
-/* Hooks for future legacy tables (fill in when enabling legacy protocol). */
-#if 0
-static const struct linuwux_kuser_op kuser_ops_legacy_single[] = { /* ... */ };
-static const struct linuwux_kuser_op kuser_ops_legacy_dual[] = { /* ... */ };
+/* Legacy Reflex profiles; overlapping stores intentionally remain ordered. */
+#define KUSER_CyclesPerYield             0x2D6
+#define KUSER_TickCountLowPad            0x378  /* near TickCount region */
+
+static const struct linuwux_kuser_op kuser_ops_legacy_single[] = {
+    KUSER_STORE4(KUSER_CyclesPerYield, 0x00010034),
+    KUSER_STORE4(KUSER_NumberOfPhysicalPages, 0x00BF9C8F),
+    KUSER_STORE4(KUSER_ActiveProcessorCount, 0x00000010),
+    KUSER_STORE4(KUSER_ProcessorFeatures + 0x14, 0x01010101),
+    KUSER_STORE4(KUSER_ProductTypeIsValid, 0x00090001),
+    KUSER_STORE4(KUSER_SharedDataFlags + 4, 0),
+    KUSER_STORE4(KUSER_NtProductType, 0x1),
+    KUSER_STORE4(KUSER_SuiteMask, 0x00000310),
+    KUSER_STORE4(KUSER_NtBuildNumber, 0x00006658),
+    KUSER_STORE4(KUSER_NtMajorVersion, 0x0A),
+    KUSER_STORE4(KUSER_NtMinorVersion, 0),
+};
+
+static const struct linuwux_kuser_op kuser_ops_legacy_dual[] = {
+    KUSER_STORE8(KUSER_NativeProcessorArchitecture + 4, 0), /* 0x26E span */
+    KUSER_STORE8(KUSER_ProcessorFeatures + 0x0F, 0x0101010000010000ULL),
+    KUSER_STORE8(KUSER_ProcessorFeatures + 0x14, 0x01010101ULL),
+    KUSER_STORE8(KUSER_ProductTypeIsValid, 0x0A00090001ULL),
+    KUSER_STORE8(KUSER_NtBuildNumber + 1, 0x0100000001000066ULL),
+    KUSER_STORE8(KUSER_NtMinorVersion + 2, 0x010100000000ULL),
+    KUSER_STORE4(KUSER_ActiveProcessorCount, 0x10),
+    KUSER_STORE8(KUSER_NtBuildNumber, 0x0100006658ULL),
+    KUSER_STORE8(KUSER_ProcessorFeatures + 0x0E, 0x0101000001000001ULL),
+    KUSER_STORE4(KUSER_SuiteMask, 0x0110),
+    KUSER_STORE4(KUSER_NumberOfPhysicalPages, 0x7FB10B),
+    KUSER_STORE4(KUSER_TickCountLowPad, 0),
+    KUSER_STORE8(KUSER_NumberOfPhysicalPages, 0x0100007FB10BULL),
+    KUSER_STORE8(KUSER_ProcessorFeatures - 1, 0x0100000101000000ULL), /* 0x273 */
+    KUSER_STORE8(KUSER_SuiteMask, KUSER_VAL_SUITE_KD_BLOB),
+    KUSER_STORE8(0x000, 0x0FA0000000000000ULL), /* TickCountLowDeprecated area */
+    KUSER_STORE8(KUSER_ProcessorFeatures + 0x0D, 0x0100000100000101ULL),
+    KUSER_STORE8(KUSER_TickCountLowPad, 0x0100000000ULL),
+    KUSER_STORE8(KUSER_ActiveProcessorCount, KUSER_VAL_ACTIVE_PROC_BLOB),
+    KUSER_STORE8(KUSER_NtMajorVersion, 0x0A),
+    KUSER_STORE4(KUSER_SharedDataFlags + 4, 0),
+    KUSER_STORE4(KUSER_NtProductType, 0x1),
+    KUSER_STORE4(KUSER_NtMinorVersion, 0),
+};
+
 static const struct linuwux_kuser_profile kuser_profile_legacy_single = {
-    .name = "legacy-single", .ops = kuser_ops_legacy_single, /* ... */
+    .name = "legacy-single",
+    .ops = kuser_ops_legacy_single,
+    .op_count = sizeof(kuser_ops_legacy_single) / sizeof(kuser_ops_legacy_single[0]),
 };
+
 static const struct linuwux_kuser_profile kuser_profile_legacy_dual = {
-    .name = "legacy-dual", .ops = kuser_ops_legacy_dual, /* ... */
+    .name = "legacy-dual",
+    .ops = kuser_ops_legacy_dual,
+    .op_count = sizeof(kuser_ops_legacy_dual) / sizeof(kuser_ops_legacy_dual[0]),
 };
-#endif
+
+static const struct linuwux_kuser_profile *
+linuwux_kuser_profile_for(int protocol)
+{
+    switch (protocol) {
+    case LINUWUX_PROTO_MODERN:
+        return &kuser_profile_modern;
+    case LINUWUX_PROTO_LEGACY_DUAL:
+        return &kuser_profile_legacy_dual;
+    case LINUWUX_PROTO_LEGACY_SINGLE:
+        return &kuser_profile_legacy_single;
+    default:
+        return NULL;
+    }
+}
 
 static void linuwux_kuser_apply(const struct linuwux_kuser_profile *profile)
 {
@@ -384,46 +518,121 @@ static void linuwux_cpuid_zero_regs(ucontext_t *ctx)
 }
 
 /*
- * Protocol leaves (DenuvOwO / future legacy) vs static identity spoof leaves.
+ * Protocol leaves (DenuvOwO / legacy) vs static identity spoof leaves.
  *
- * Action leaves mutate runtime state (handler, KUSER, faketime) and return
- * zeroed regs. Static leaves only fill EAX–EDX. Adding a protocol is a new
- * action entry + optional KUSER profile — not another giant switch.
+ * Action leaves mutate runtime state (handler, KUSER, faketime). Static leaves
+ * only fill EAX–EDX. Adding a protocol is a new action entry and profile.
  */
 #define LINUWUX_CPUID_LEAF_ARM      0x336933u
 #define LINUWUX_CPUID_LEAF_FAKETIME 0x336967u
-
-enum linuwux_protocol {
-    LINUWUX_PROTO_NONE = 0,
-    LINUWUX_PROTO_MODERN = 1,
-    /* LINUWUX_PROTO_LEGACY_SINGLE = 2, */
-    /* LINUWUX_PROTO_LEGACY_DUAL   = 3, */
-};
-
-static _Atomic int g_protocol = LINUWUX_PROTO_NONE;
+#define LINUWUX_CPUID_LEAF_LEGACY_INIT 0x69696969u
+#define LINUWUX_CPUID_LEAF_LEGACY_KUSER 0x1337u
+#define LINUWUX_CPUID_LEAF_LEGACY_QUERY_SYSTEM_ID 0x336943u
+#define LINUWUX_CPUID_LEAF_LEGACY_QUERY_FULL_HANDLER 0x336934u
+#define LINUWUX_CPUID_LEAF_LEGACY_QUERY_FULL_ID 0x336944u
 
 /* ---- action leaves ---- */
 
-static void linuwux_cpuid_action_arm(ucontext_t *ctx)
+static int linuwux_cpuid_action_arm(unsigned int leaf, ucontext_t *ctx)
 {
     uint64_t handler = (uint64_t)ctx->uc_mcontext.gregs[REG_RCX];
+    int protocol = atomic_load(&g_proto.protocol);
 
-    atomic_store(&g_target_sys_handler, handler);
-    atomic_store(&g_protocol, LINUWUX_PROTO_MODERN);
+    (void)leaf;
+
+    atomic_store(&g_proto.handler, handler);
+
+    if (linuwux_protocol_is_legacy(protocol)) {
+        /* KUSER applied on LEGACY_KUSER leaf. */
+        linuwux_log("cpuid arm leaf, protocol=legacy handler=%#llx\n",
+                    (unsigned long long)handler);
+        linuwux_set_hwprofile_guid();
+        linuwux_cpuid_zero_regs(ctx);
+        return 1;
+    }
+
+    atomic_store(&g_proto.protocol, LINUWUX_PROTO_MODERN);
+    atomic_store(&g_proto.rax_is_resume, 1);
     linuwux_log("cpuid arm leaf, protocol=modern TargetSysHandler=%#llx\n",
                 (unsigned long long)handler);
-    linuwux_kuser_apply(&kuser_profile_modern);
+    linuwux_kuser_apply(linuwux_kuser_profile_for(LINUWUX_PROTO_MODERN));
     linuwux_set_hwprofile_guid();
     linuwux_cpuid_zero_regs(ctx);
+    return 1;
 }
 
-static void linuwux_cpuid_action_faketime(ucontext_t *ctx)
+static int linuwux_cpuid_action_faketime(unsigned int leaf, ucontext_t *ctx)
 {
+    (void)leaf;
     linuwux_set_faketime((long long)ctx->uc_mcontext.gregs[REG_RCX]);
     linuwux_cpuid_zero_regs(ctx);
+    return 1;
 }
 
-typedef void (*linuwux_cpuid_action_fn)(ucontext_t *ctx);
+static int linuwux_cpuid_action_legacy_init(unsigned int leaf, ucontext_t *ctx)
+{
+    int protocol = atomic_load(&g_proto.protocol);
+
+    (void)leaf;
+
+    if (protocol == LINUWUX_PROTO_MODERN)
+        return 0;
+
+    if (protocol == LINUWUX_PROTO_NONE) {
+        atomic_store(&g_proto.protocol, LINUWUX_PROTO_LEGACY_SINGLE);
+        atomic_store(&g_proto.rax_is_resume, 0);
+    }
+    linuwux_log("initialized legacy Reflex CPUID protocol\n");
+    linuwux_cpuid_zero_regs(ctx);
+    return 1;
+}
+
+static int linuwux_cpuid_action_legacy_kuser(unsigned int leaf, ucontext_t *ctx)
+{
+    int protocol = atomic_load(&g_proto.protocol);
+    const struct linuwux_kuser_profile *profile;
+
+    (void)leaf;
+
+    if (!linuwux_protocol_is_legacy(protocol))
+        return 0;
+
+    profile = linuwux_kuser_profile_for(protocol);
+    if (profile &&
+        (protocol == LINUWUX_PROTO_LEGACY_DUAL || atomic_load(&g_proto.handler)))
+        linuwux_kuser_apply(profile);
+    else
+        linuwux_log("legacy KUSER_SHARED_DATA leaf arrived before handler registration\n");
+    linuwux_cpuid_zero_regs(ctx);
+    return 1;
+}
+
+static int linuwux_cpuid_action_legacy_query(unsigned int leaf, ucontext_t *ctx)
+{
+    int protocol = atomic_load(&g_proto.protocol);
+
+    if (!linuwux_protocol_is_legacy(protocol))
+        return 0;
+
+    atomic_store(&g_proto.protocol, LINUWUX_PROTO_LEGACY_DUAL);
+    switch (leaf) {
+    case LINUWUX_CPUID_LEAF_LEGACY_QUERY_SYSTEM_ID:
+        atomic_store(&g_proto.system_id, (uint32_t)ctx->uc_mcontext.gregs[REG_RCX]);
+        break;
+    case LINUWUX_CPUID_LEAF_LEGACY_QUERY_FULL_HANDLER:
+        atomic_store(&g_proto.full_handler, (uint64_t)ctx->uc_mcontext.gregs[REG_RCX]);
+        break;
+    case LINUWUX_CPUID_LEAF_LEGACY_QUERY_FULL_ID:
+        atomic_store(&g_proto.full_id, (uint32_t)ctx->uc_mcontext.gregs[REG_RCX]);
+        break;
+    default:
+        return 0;
+    }
+    linuwux_cpuid_zero_regs(ctx);
+    return 1;
+}
+
+typedef int (*linuwux_cpuid_action_fn)(unsigned int leaf, ucontext_t *ctx);
 
 struct linuwux_cpuid_action_leaf {
     unsigned int leaf;
@@ -433,9 +642,11 @@ struct linuwux_cpuid_action_leaf {
 static const struct linuwux_cpuid_action_leaf cpuid_action_leaves[] = {
     { LINUWUX_CPUID_LEAF_ARM,      linuwux_cpuid_action_arm },
     { LINUWUX_CPUID_LEAF_FAKETIME, linuwux_cpuid_action_faketime },
-    /* Legacy leaves land here later, e.g.:
-     * { LINUWUX_CPUID_LEAF_LEGACY_INIT, linuwux_cpuid_action_legacy_init },
-     */
+    { LINUWUX_CPUID_LEAF_LEGACY_INIT, linuwux_cpuid_action_legacy_init },
+    { LINUWUX_CPUID_LEAF_LEGACY_KUSER, linuwux_cpuid_action_legacy_kuser },
+    { LINUWUX_CPUID_LEAF_LEGACY_QUERY_SYSTEM_ID, linuwux_cpuid_action_legacy_query },
+    { LINUWUX_CPUID_LEAF_LEGACY_QUERY_FULL_HANDLER, linuwux_cpuid_action_legacy_query },
+    { LINUWUX_CPUID_LEAF_LEGACY_QUERY_FULL_ID, linuwux_cpuid_action_legacy_query },
 };
 
 /* ---- static identity spoof leaves ---- */
@@ -444,8 +655,15 @@ enum {
     LINUWUX_CPUID_STATIC_ECX_OR_UNARMED_BIT31 = 1 << 0, /* leaf 1: bit31 until armed */
 };
 
+enum linuwux_cpuid_static_profile {
+    LINUWUX_CPUID_STATIC_ANY = 0,
+    LINUWUX_CPUID_STATIC_MODERN,
+    LINUWUX_CPUID_STATIC_LEGACY,
+};
+
 struct linuwux_cpuid_static_leaf {
     unsigned int leaf;
+    int profile;
     unsigned int flags;
     /* Non-NULL => read live spoof regs from vendor detect; else use constants. */
     unsigned int *eax, *ebx, *ecx, *edx;
@@ -455,36 +673,79 @@ struct linuwux_cpuid_static_leaf {
 static const struct linuwux_cpuid_static_leaf cpuid_static_leaves[] = {
     {
         .leaf = 1,
+        .profile = LINUWUX_CPUID_STATIC_MODERN,
         .flags = LINUWUX_CPUID_STATIC_ECX_OR_UNARMED_BIT31,
         .eax = &g_spoof_leaf1.eax, .ebx = &g_spoof_leaf1.ebx,
         .ecx = &g_spoof_leaf1.ecx, .edx = &g_spoof_leaf1.edx,
     },
     {
+        /* Shared across protocols — not identity-sensitive brand strings. */
         .leaf = 0x40000000,
+        .profile = LINUWUX_CPUID_STATIC_ANY,
         .eax = &g_spoof_hypervisor_info.eax, .ebx = &g_spoof_hypervisor_info.ebx,
         .ecx = &g_spoof_hypervisor_info.ecx, .edx = &g_spoof_hypervisor_info.edx,
     },
     {
         .leaf = 0x40000001,
+        .profile = LINUWUX_CPUID_STATIC_ANY,
         .eax = &g_spoof_hypervisor_feat.eax, .ebx = &g_spoof_hypervisor_feat.ebx,
         .ecx = &g_spoof_hypervisor_feat.ecx, .edx = &g_spoof_hypervisor_feat.edx,
     },
     /* Brand string: "DenuvoOwO CPU @ 1337GHz" style constants. */
     {
         .leaf = 0x80000002,
+        .profile = LINUWUX_CPUID_STATIC_MODERN,
         .c_eax = 0x756E6544, .c_ebx = 0x4F774F76,
         .c_ecx = 0x55504320, .c_edx = 0x31204020,
     },
     {
         .leaf = 0x80000003,
+        .profile = LINUWUX_CPUID_STATIC_MODERN,
         .c_eax = 0x20373333, .c_ebx = 0x007A4847,
         .c_ecx = 0x00000000, .c_edx = 0x00000000,
     },
     {
         .leaf = 0x80000004,
+        .profile = LINUWUX_CPUID_STATIC_MODERN,
         .c_eax = 0, .c_ebx = 0, .c_ecx = 0, .c_edx = 0,
     },
+    /* Legacy profile: AMD Ryzen 9 5900X 12-Core Processor. */
+    {
+        .leaf = 1,
+        .profile = LINUWUX_CPUID_STATIC_LEGACY,
+        .c_eax = 0x00A20F10, .c_ebx = 0x00180800,
+        .c_ecx = 0x7AD8320B, .c_edx = 0x178BFBFF,
+    },
+    {
+        .leaf = 0x80000002,
+        .profile = LINUWUX_CPUID_STATIC_LEGACY,
+        .c_eax = 0x20444D41, .c_ebx = 0x657A7952,
+        .c_ecx = 0x2039206E, .c_edx = 0x30303935,
+    },
+    {
+        .leaf = 0x80000003,
+        .profile = LINUWUX_CPUID_STATIC_LEGACY,
+        .c_eax = 0x32312058, .c_ebx = 0x726F432D,
+        .c_ecx = 0x72502065, .c_edx = 0x7365636F,
+    },
+    {
+        .leaf = 0x80000004,
+        .profile = LINUWUX_CPUID_STATIC_LEGACY,
+        .c_eax = 0x20726F73, .c_ebx = 0x20202020,
+        .c_ecx = 0x20202020, .c_edx = 0x00202020,
+    },
 };
+
+static int linuwux_cpuid_static_profile_matches(int profile)
+{
+    int protocol = atomic_load(&g_proto.protocol);
+
+    if (profile == LINUWUX_CPUID_STATIC_ANY)
+        return 1;
+    if (profile == LINUWUX_CPUID_STATIC_LEGACY)
+        return linuwux_protocol_is_legacy(protocol);
+    return !linuwux_protocol_is_legacy(protocol);
+}
 
 static int linuwux_cpuid_dispatch_action(unsigned int leaf, ucontext_t *ctx)
 {
@@ -492,8 +753,7 @@ static int linuwux_cpuid_dispatch_action(unsigned int leaf, ucontext_t *ctx)
 
     for (i = 0; i < sizeof(cpuid_action_leaves) / sizeof(cpuid_action_leaves[0]); i++) {
         if (cpuid_action_leaves[i].leaf == leaf) {
-            cpuid_action_leaves[i].action(ctx);
-            return 1;
+            return cpuid_action_leaves[i].action(leaf, ctx);
         }
     }
     return 0;
@@ -509,6 +769,8 @@ static int linuwux_cpuid_dispatch_static(unsigned int leaf, ucontext_t *ctx)
 
         if (s->leaf != leaf)
             continue;
+        if (!linuwux_cpuid_static_profile_matches(s->profile))
+            continue;
 
         if (s->eax) {
             eax = *s->eax;
@@ -523,7 +785,7 @@ static int linuwux_cpuid_dispatch_static(unsigned int leaf, ucontext_t *ctx)
         }
 
         if (s->flags & LINUWUX_CPUID_STATIC_ECX_OR_UNARMED_BIT31) {
-            if (!atomic_load(&g_target_sys_handler))
+            if (!atomic_load(&g_proto.handler))
                 ecx |= (1u << 31);
         }
 

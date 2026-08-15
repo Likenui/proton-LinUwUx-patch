@@ -2,25 +2,27 @@
   <img src="assets/banner.png" alt="LinUwUx — LD_PRELOAD runtime" width="880">
 </p>
 
-`liblinuwux.so` — an `LD_PRELOAD` library that applies the **LinUwUx** DenuvOwO hypervisor-bypass set under **GE-Proton** or **CachyOS Proton**. No Proton/Wine source patches, no prefix registry imports, no launcher script rewrites.
+`liblinuwux.so` — an `LD_PRELOAD` library that supplies the Linux/Wine-side interpositions required by certain Windows software that expects a specific CPUID-faulting and signal protocol under **GE-Proton** or **CachyOS Proton**.
+
+**No Proton/Wine source patches, no prefix registry imports, no launcher script rewrites.**
 
 **Official Valve Proton is not supported.** Use GE-Proton or CachyOS Proton.
 
-This project does **not** set up host-side requirements (UMIP, HV DKMS, etc.) — see [cs.rin.ru](https://csrin.org) for those.
+This project does **not** configure the host CPU or install any hypervisor. Those are separate system-level steps (UMIP, `cpuid_fault` support, etc.).
 
 ## What it covers
 
-One library (`liblinuwux.so`) handles **modern** and **legacy** DenuvOwO / Reflex layouts. Protocol is detected at runtime — there is no second `.so` or `linuwux-legacy` wrapper.
+One library (`liblinuwux.so`) handles both the modern and legacy protocol layouts used by the software it supports. The protocol is detected at runtime — there is no second `.so` or legacy wrapper.
 
-The process is treated as a game when the Windows target exe sits next to a known marker (existence only, never loaded), for example:
+A process is treated as a target when the Windows executable sits next to a known marker file, for example:
 
-- `reflex.dll` / `reflex64.dll` — modern reflex-loader packs
-- `DenuvOwO.dll` — older hybrid DenuvOwO loader
-- `DenuvOwO.ini` — winmm-loader packs without reflex.dll
+- `reflex.dll` / `reflex64.dll`
+- `winmm.dll`
+- `version.dll`
 
-### Older packs with `launcher.exe`
+### Older packages that ship `launcher.exe`
 
-Some older DenuvOwO releases ship a Windows `launcher.exe`. **On Linux you do not need it.** Point Steam / Lutris / Heroic / umu at the **game binary** the same way you do for modern titles (e.g. `Game.exe`), with `linuwux` on that game’s launch options only.
+Some older packages include a Windows `launcher.exe`. **On Linux you do not need it.** Point Steam / Lutris / Heroic / umu at the actual game binary the same way you do for any other title, and put `linuwux` only on that game’s launch options.
 
 ## Install
 

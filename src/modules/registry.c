@@ -34,7 +34,8 @@
 /*
  * Resolve a symbol from already-loaded ntdll.so (not via RTLD_DEFAULT).
  * Try bare SONAME first; fall back to /proc/self/maps path + RTLD_NOLOAD.
- * May run under SIGSEGV (arm -> hwprofile); fopen/dlopen are not AS-safe.
+ * Called from normal context only (sigaction intercept), never under
+ * SIGSEGV — fopen/dlopen/NtCreateKey are not AS-safe.
  * Late callers do not wait on a stuck resolver — return NULL instead.
  */
 enum { LINUWUX_NTDLL_NOT_STARTED = 0, LINUWUX_NTDLL_IN_PROGRESS = 1, LINUWUX_NTDLL_DONE = 2 };

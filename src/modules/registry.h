@@ -20,7 +20,7 @@
 #ifndef LINUWUX_REGISTRY_H
 #define LINUWUX_REGISTRY_H
 
-/* Write Hardware Profiles\0001\HwProfileGuid once (arm leaf). */
+/* Write Hardware Profiles\0001\HwProfileGuid once (early game init). */
 void linuwux_set_hwprofile_guid(void);
 
 #endif /* LINUWUX_REGISTRY_H */

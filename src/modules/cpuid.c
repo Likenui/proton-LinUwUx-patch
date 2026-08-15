@@ -35,7 +35,6 @@
 #include "linuwux.h"
 #include "cpuid.h"
 #include "faketime.h"
-#include "registry.h"
 
 enum linuwux_protocol {
     LINUWUX_PROTO_NONE = 0,
@@ -583,7 +582,6 @@ static int linuwux_cpuid_action_arm(unsigned int leaf, ucontext_t *ctx)
         /* KUSER applied on LEGACY_KUSER leaf. */
         linuwux_log("cpuid arm leaf, protocol=legacy handler=%#llx\n",
                     (unsigned long long)handler);
-        linuwux_set_hwprofile_guid();
         linuwux_cpuid_zero_regs(ctx);
         return 1;
     }
@@ -592,7 +590,6 @@ static int linuwux_cpuid_action_arm(unsigned int leaf, ucontext_t *ctx)
     linuwux_log("cpuid arm leaf, protocol=modern TargetSysHandler=%#llx\n",
                 (unsigned long long)handler);
     linuwux_kuser_apply(linuwux_kuser_profile_for(LINUWUX_PROTO_MODERN));
-    linuwux_set_hwprofile_guid();
     linuwux_cpuid_zero_regs(ctx);
     return 1;
 }

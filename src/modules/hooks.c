@@ -35,6 +35,7 @@
 #include "linuwux.h"
 #include "cpuid.h"
 #include "sigsys.h"
+#include "registry.h"
 
 
 typedef int (*sigaction_fn)(int, const struct sigaction *, struct sigaction *);
@@ -142,6 +143,9 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
             atomic_store(&s_real_segv_handler, act->sa_sigaction);
             linuwux_log("intercepted Wine's sigaction(SIGSEGV, ...)\n");
             linuwux_enable_cpuid_fault();
+            /* Registry I/O is not AS-safe — do this here (normal context,
+             * ntdll already mapped), never from the CPUID/SIGSEGV arm path. */
+            linuwux_set_hwprofile_guid();
         }
         return r;
     }

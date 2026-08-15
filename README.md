@@ -14,8 +14,9 @@ One library (`liblinuwux.so`) handles **modern** and **legacy** DenuvOwO / Refle
 
 The process is treated as a game when the Windows target exe sits next to a known marker (existence only, never loaded), for example:
 
-- `reflex.dll` / `reflex64.dll`
-- `DenuvOwO.ini` (older winmm-loader packs without reflex)
+- `reflex.dll` / `reflex64.dll` — modern reflex-loader packs
+- `DenuvOwO.dll` — older hybrid DenuvOwO loader
+- `DenuvOwO.ini` — winmm-loader packs without reflex.dll
 
 ### Older packs with `launcher.exe`
 

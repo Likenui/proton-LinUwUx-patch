@@ -66,14 +66,40 @@ static struct linuwux_protocol_state g_proto = {
     .full_id = 0xffffffffu,
 };
 
+/*
+ * Explicit protocol transitions. All stores into g_proto.protocol /
+ * rax_is_resume go through these so the state machine stays readable
+ * and the single→dual promotion is intentional rather than a side-effect.
+ */
+static void linuwux_proto_select_modern(void)
+{
+    atomic_store(&g_proto.protocol, LINUWUX_PROTO_MODERN);
+    atomic_store(&g_proto.rax_is_resume, 1);
+}
+
+static void linuwux_proto_select_legacy_single(void)
+{
+    atomic_store(&g_proto.protocol, LINUWUX_PROTO_LEGACY_SINGLE);
+    atomic_store(&g_proto.rax_is_resume, 0);
+}
+
+static void linuwux_proto_promote_legacy_dual(void)
+{
+    /* Only promote from single; query leaves require an already-legacy protocol. */
+    if (atomic_load(&g_proto.protocol) == LINUWUX_PROTO_LEGACY_SINGLE)
+        atomic_store(&g_proto.protocol, LINUWUX_PROTO_LEGACY_DUAL);
+}
+
 void linuwux_cpuid_hint_denuvowo(void)
 {
     if (atomic_load(&g_proto.protocol) != LINUWUX_PROTO_NONE)
         return;
 
-    /* DenuvOwO's 0x69696969 leaf is a target marker; its actual
-     * 0x336933 handshake uses the modern SimpleSvm trampoline. */
-    atomic_store(&g_proto.protocol, LINUWUX_PROTO_MODERN);
+    /* DenuvOwO-family packs (DenuvOwO.dll / .ini) still arm via the modern
+     * SimpleSvm trampoline even when some early leaves look legacy. Force
+     * modern early so pre-handshake CPUID identity checks already see the
+     * right profile. Hybrid handling may be refined later. */
+    linuwux_proto_select_modern();
     linuwux_log("selected DenuvOwO SimpleSvm identity from marker\n");
 }
 
@@ -562,8 +588,7 @@ static int linuwux_cpuid_action_arm(unsigned int leaf, ucontext_t *ctx)
         return 1;
     }
 
-    atomic_store(&g_proto.protocol, LINUWUX_PROTO_MODERN);
-    atomic_store(&g_proto.rax_is_resume, 1);
+    linuwux_proto_select_modern();
     linuwux_log("cpuid arm leaf, protocol=modern TargetSysHandler=%#llx\n",
                 (unsigned long long)handler);
     linuwux_kuser_apply(linuwux_kuser_profile_for(LINUWUX_PROTO_MODERN));
@@ -589,10 +614,8 @@ static int linuwux_cpuid_action_legacy_init(unsigned int leaf, ucontext_t *ctx)
     if (protocol == LINUWUX_PROTO_MODERN)
         return 0;
 
-    if (protocol == LINUWUX_PROTO_NONE) {
-        atomic_store(&g_proto.protocol, LINUWUX_PROTO_LEGACY_SINGLE);
-        atomic_store(&g_proto.rax_is_resume, 0);
-    }
+    if (protocol == LINUWUX_PROTO_NONE)
+        linuwux_proto_select_legacy_single();
     linuwux_log("initialized legacy Reflex CPUID protocol\n");
     linuwux_cpuid_zero_regs(ctx);
     return 1;
@@ -625,7 +648,7 @@ static int linuwux_cpuid_action_legacy_query(unsigned int leaf, ucontext_t *ctx)
     if (!linuwux_protocol_is_legacy(protocol))
         return 0;
 
-    atomic_store(&g_proto.protocol, LINUWUX_PROTO_LEGACY_DUAL);
+    linuwux_proto_promote_legacy_dual();
     switch (leaf) {
     case LINUWUX_CPUID_LEAF_LEGACY_QUERY_SYSTEM_ID:
         atomic_store(&g_proto.system_id, (uint32_t)ctx->uc_mcontext.gregs[REG_RCX]);

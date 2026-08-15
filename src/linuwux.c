@@ -57,8 +57,11 @@ static void linuwux_append_override(char *buf, size_t bufsize, const char *entry
 
 /*
  * is_game markers beside the Windows target exe (existence only, never loaded):
- *   reflex.dll / reflex64.dll  — reflex-loader scene layout
- *   DenuvOwO.dll               — DenuvOwO loader layout (no reflex.dll)
+ *   reflex.dll / reflex64.dll  — modern reflex-loader packs
+ *   DenuvOwO.dll               — older hybrid DenuvOwO loader
+ *   DenuvOwO.ini               — winmm-loader packs (no reflex.dll)
+ *
+ * Prefer reflex* when both families are present.
  */
 enum linuwux_game_marker {
     LINUWUX_GAME_NONE = 0,
@@ -77,14 +80,17 @@ static int linuwux_dir_game_marker(const char *dir)
         return 0;
 
     while ((ent = readdir(d))) {
-        if (!strcasecmp(ent->d_name, "DenuvOwO.dll")) {
-            marker = LINUWUX_GAME_DENUVOWO;
-            linuwux_log("Found %s\n", ent->d_name);
-            break;
-        }
         if (!strcasecmp(ent->d_name, "reflex.dll") ||
             !strcasecmp(ent->d_name, "reflex64.dll")) {
             marker = LINUWUX_GAME_REFLEX;
+            linuwux_log("Found %s\n", ent->d_name);
+            /* Prefer modern reflex over any DenuvOwO marker. */
+            continue;
+        }
+        if (marker == LINUWUX_GAME_NONE &&
+            (!strcasecmp(ent->d_name, "DenuvOwO.dll") ||
+             !strcasecmp(ent->d_name, "DenuvOwO.ini"))) {
+            marker = LINUWUX_GAME_DENUVOWO;
             linuwux_log("Found %s\n", ent->d_name);
         }
     }

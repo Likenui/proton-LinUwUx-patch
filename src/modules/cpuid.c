@@ -66,6 +66,17 @@ static struct linuwux_protocol_state g_proto = {
     .full_id = 0xffffffffu,
 };
 
+void linuwux_cpuid_hint_denuvowo(void)
+{
+    if (atomic_load(&g_proto.protocol) != LINUWUX_PROTO_NONE)
+        return;
+
+    /* DenuvOwO's 0x69696969 leaf is a target marker; its actual
+     * 0x336933 handshake uses the modern SimpleSvm trampoline. */
+    atomic_store(&g_proto.protocol, LINUWUX_PROTO_MODERN);
+    linuwux_log("selected DenuvOwO SimpleSvm identity from marker\n");
+}
+
 /* Spoofed CPUID identity, filled once in the constructor. */
 struct linuwux_cpuid_regs {
     unsigned int eax, ebx, ecx, edx;

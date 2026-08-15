@@ -19,7 +19,8 @@
 
 /*
  * linuwux — LD_PRELOAD library for DenuvOwO under Wine/Proton.
- * Constructor only; modules/ holds hooks, cpuid, sigsys, registry, faketime.
+ * Constructor only; modules/ holds hooks, cpuid, sigsys, registry, faketime,
+ * overrides.
  * Debug: LINUWUX_DEBUG=1
  */
 
@@ -37,23 +38,11 @@
 #include "modules/linuwux.h"
 #include "modules/cpuid.h"
 #include "modules/faketime.h"
+#include "modules/overrides.h"
 
 /* Kept for `strings` / `linuwux --version`. */
 static const char linuwux_version_tag[] __attribute__((used)) =
     "linuwux " LINUWUX_VERSION;
-
-static void linuwux_append_override(char *buf, size_t bufsize, const char *entry)
-{
-    size_t len = strlen(buf);
-    int n;
-
-    if (len >= bufsize)
-        return;
-
-    n = snprintf(buf + len, bufsize - len, "%s%s", len ? ";" : "", entry);
-    if (n < 0 || len + (size_t)n >= bufsize)
-        linuwux_log("WINEDLLOVERRIDES: not enough room to append \"%s\" -- skipping\n", entry);
-}
 
 /*
  * is_game markers beside the Windows target exe (existence only, never loaded):
@@ -62,6 +51,9 @@ static void linuwux_append_override(char *buf, size_t bufsize, const char *entry
  *   DenuvOwO.ini               — winmm-loader packs (no reflex.dll)
  *
  * Prefer reflex* when both families are present.
+ *
+ * The same directory walk also records pack-native DLLs we may need to
+ * prefer via WINEDLLOVERRIDES (winmm / version / reflex / reflex64).
  */
 enum linuwux_game_marker {
     LINUWUX_GAME_NONE = 0,
@@ -69,37 +61,59 @@ enum linuwux_game_marker {
     LINUWUX_GAME_DENUVOWO,
 };
 
-static int linuwux_dir_game_marker(const char *dir)
+struct linuwux_game_scan {
+    int marker;
+    unsigned native; /* LINUWUX_NATIVE_* from overrides.h */
+};
+
+static void linuwux_dir_scan(const char *dir, struct linuwux_game_scan *out)
 {
     DIR *d;
     struct dirent *ent;
-    int marker = LINUWUX_GAME_NONE;
+
+    out->marker = LINUWUX_GAME_NONE;
+    out->native = 0;
 
     d = opendir(dir);
     if (!d)
-        return 0;
+        return;
 
     while ((ent = readdir(d))) {
-        if (!strcasecmp(ent->d_name, "reflex.dll") ||
-            !strcasecmp(ent->d_name, "reflex64.dll")) {
-            marker = LINUWUX_GAME_REFLEX;
+        if (!strcasecmp(ent->d_name, "reflex.dll")) {
+            out->marker = LINUWUX_GAME_REFLEX;
+            out->native |= LINUWUX_NATIVE_REFLEX;
             linuwux_log("Found %s\n", ent->d_name);
-            /* Prefer modern reflex over any DenuvOwO marker. */
             continue;
         }
-        if (marker == LINUWUX_GAME_NONE &&
+        if (!strcasecmp(ent->d_name, "reflex64.dll")) {
+            out->marker = LINUWUX_GAME_REFLEX;
+            out->native |= LINUWUX_NATIVE_REFLEX64;
+            linuwux_log("Found %s\n", ent->d_name);
+            continue;
+        }
+        if (!strcasecmp(ent->d_name, "winmm.dll")) {
+            out->native |= LINUWUX_NATIVE_WINMM;
+            continue;
+        }
+        if (!strcasecmp(ent->d_name, "version.dll")) {
+            out->native |= LINUWUX_NATIVE_VERSION;
+            continue;
+        }
+        if (out->marker == LINUWUX_GAME_NONE &&
             (!strcasecmp(ent->d_name, "DenuvOwO.dll") ||
              !strcasecmp(ent->d_name, "DenuvOwO.ini"))) {
-            marker = LINUWUX_GAME_DENUVOWO;
+            out->marker = LINUWUX_GAME_DENUVOWO;
             linuwux_log("Found %s\n", ent->d_name);
         }
     }
     closedir(d);
-
-    return marker;
 }
 
-static int linuwux_game_dir_marker(const char *argv0)
+/*
+ * Resolve argv[1] Windows path (X:\...) to the host directory that holds
+ * the target exe, then scan it for markers and pack-native DLLs.
+ */
+static void linuwux_game_dir_scan(const char *argv1, struct linuwux_game_scan *out)
 {
     const char *prefix;
     char path[PATH_MAX];
@@ -107,25 +121,26 @@ static int linuwux_game_dir_marker(const char *argv0)
     char *slash;
     size_t i;
 
-    if (!argv0 || !argv0[0] || argv0[1] != ':')
-        return 0;
+    out->marker = LINUWUX_GAME_NONE;
+    out->native = 0;
 
-    drive = (char)tolower((unsigned char)argv0[0]);
+    if (!argv1 || !argv1[0] || argv1[1] != ':')
+        return;
+
+    drive = (char)tolower((unsigned char)argv1[0]);
 
     /* Z: = host filesystem root; skip dosdevices. */
     if (drive == 'z') {
-        if (snprintf(path, sizeof(path), "%s", argv0 + 2) >= (int)sizeof(path))
-            return 0;
+        if (snprintf(path, sizeof(path), "%s", argv1 + 2) >= (int)sizeof(path))
+            return;
     } else {
-        /* dosdevices/<drive>: */
         prefix = getenv("WINEPREFIX");
-        if (!prefix) {
-            /* dosdevices mapping missing for this drive. */
-            return 0;
-        }
+        if (!prefix)
+            return;
 
-        if (snprintf(path, sizeof(path), "%s/dosdevices/%c:%s", prefix, drive, argv0 + 2) >= (int)sizeof(path))
-            return 0;
+        if (snprintf(path, sizeof(path), "%s/dosdevices/%c:%s",
+                     prefix, drive, argv1 + 2) >= (int)sizeof(path))
+            return;
     }
 
     for (i = 0; path[i]; i++)
@@ -134,10 +149,10 @@ static int linuwux_game_dir_marker(const char *argv0)
 
     slash = strrchr(path, '/');
     if (!slash)
-        return 0;
+        return;
     *slash = '\0';
 
-    return linuwux_dir_game_marker(path);
+    linuwux_dir_scan(path, out);
 }
 
 /* /proc/self/comm holds the kernel task name (<=15 chars + NUL); wineserver
@@ -167,15 +182,14 @@ static int linuwux_proc_comm_is_wineserver(void)
 __attribute__((constructor))
 static void linuwux_init(int argc, char **argv, char **envp)
 {
-    char overrides[4096];
-    const char *existing;
-    int n, marker, is_game, is_wineserver;
+    struct linuwux_game_scan scan;
+    int is_game, is_wineserver;
 
     (void)envp;
 
     /* Wine: argv[0] is the loader; argv[1] is the Windows target path. */
-    marker = linuwux_game_dir_marker(argc > 1 ? argv[1] : NULL);
-    is_game = marker != LINUWUX_GAME_NONE;
+    linuwux_game_dir_scan(argc > 1 ? argv[1] : NULL, &scan);
+    is_game = scan.marker != LINUWUX_GAME_NONE;
     linuwux_set_game_process(is_game);
     if (is_game && argc > 1 && argv[1]) {
         const char *exe = argv[1];
@@ -200,32 +214,18 @@ static void linuwux_init(int argc, char **argv, char **envp)
 
     /* Spoof leaves only needed in the game process (CPUID path gated). */
     if (is_game) {
-        if (marker == LINUWUX_GAME_DENUVOWO)
+        if (scan.marker == LINUWUX_GAME_DENUVOWO)
             linuwux_cpuid_hint_denuvowo();
         linuwux_detect_cpu_vendor();
     }
 
-    /* Overrides only in the game process (Wine reads env at PE load). */
-    if (is_game) {
-        /* Append our DLL overrides without clobbering user-set keys. */
-        existing = getenv("WINEDLLOVERRIDES");
-        n = snprintf(overrides, sizeof(overrides), "%s", existing ? existing : "");
-        if (existing && (n < 0 || (size_t)n >= sizeof(overrides)))
-            linuwux_log("WINEDLLOVERRIDES: existing value (%zu bytes) doesn't fit our %zu-byte buffer -- truncated\n",
-                         strlen(existing), sizeof(overrides));
-
-        if (!existing || !strstr(existing, "winmm="))
-            linuwux_append_override(overrides, sizeof(overrides), "winmm=n,b");
-        if (!existing || !strstr(existing, "version="))
-            linuwux_append_override(overrides, sizeof(overrides), "version=n,b");
-        if (!existing || !strstr(existing, "reflex="))
-            linuwux_append_override(overrides, sizeof(overrides), "reflex=n,b");
-        if (!existing || !strstr(existing, "reflex64="))
-            linuwux_append_override(overrides, sizeof(overrides), "reflex64=n,b");
-
-        setenv("WINEDLLOVERRIDES", overrides, 1);
-        linuwux_log("WINEDLLOVERRIDES=\"%s\"\n", overrides);
-    }
+    /*
+     * DLL load order only in the game process (Wine reads env at PE load).
+     * Existence-gated merge: prefer native winmm/version/reflex only when
+     * those files sit next to the exe. User/Proton keys are never clobbered.
+     */
+    if (is_game)
+        linuwux_overrides_apply(scan.native);
 
     /* Global: Proton may read this before any Wine process starts. */
     setenv("PROTON_DISABLE_LSTEAMCLIENT", "1", 0);
